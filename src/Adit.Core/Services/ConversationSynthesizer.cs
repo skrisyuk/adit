@@ -12,10 +12,11 @@ public sealed class ConversationSynthesizer
     public ConversationSynthesisResult Synthesize(
         IEnumerable<MessageRecord> messages,
         IEnumerable<ContactRecord> contacts,
-        IEnumerable<StoredNotificationRecord>? notifications = null)
+        IEnumerable<StoredNotificationRecord>? notifications = null,
+        IReadOnlyCollection<string>? selfPhoneNumbers = null)
     {
         var contactIndex = BuildContactIndex(contacts);
-        var selfIdentity = BuildSelfIdentity(contacts);
+        var selfIdentity = BuildSelfIdentity(contacts, selfPhoneNumbers);
         var notificationHints = BuildNotificationHints(notifications ?? Array.Empty<StoredNotificationRecord>());
         var synthesizedMapMessages = messages
             .Select(message => SynthesizeMessage(message, contactIndex, selfIdentity, notificationHints))
@@ -373,8 +374,64 @@ public sealed class ConversationSynthesizer
             ParticipantRole.RecipientAddressing,
             direction);
 
+        // A MAP vCard describes one person; its email is not an additional SMS participant.
+        // Only fold aliases supported by the same card and the actual SMS phone address.
+        if (IsPlainSms(message))
+        {
+            CollapseSmsCardAliases(participants, message.Originators, message.SenderAddressing, message);
+            CollapseSmsCardAliases(participants, message.Recipients, message.RecipientAddressing, message);
+        }
+
+        // MAP lists both ends of a direct SMS. The local recipient is not a second counterparty.
+        // Do not apply this rule to MMS/email/unknown direction or explicit multi-party metadata.
+        if (direction == MessageDirection.Inbound && IsPlainSms(message)
+            && participants.Values.Count(p => p.HasSenderSideRole) == 1
+            && participants.Values.Count(p => p.HasRecipientSideRole) <= 1
+            && participants.Values.All(p => p.Phones.Count == 1))
+        {
+            foreach (var participant in participants.Values.Where(p => p.HasRecipientSideRole && !p.HasSenderSideRole))
+                participant.IsSelf = true;
+        }
         return participants.Values.ToArray();
     }
+
+    private static void CollapseSmsCardAliases(
+        Dictionary<string, MutableParticipant> participants,
+        IReadOnlyList<MessageParticipantRecord> cards,
+        string? smsAddress,
+        MessageRecord message)
+    {
+        if (string.IsNullOrWhiteSpace(smsAddress) || TryExtractEmail(smsAddress, out _)) return;
+        var addressPhone = PhoneNumberNormalizer.Normalize(smsAddress);
+        if (addressPhone is null) return;
+        var allCards = message.Originators.Concat(message.Recipients).ToArray();
+        foreach (var card in cards)
+        {
+            var phones = card.Phones.Select(p => PhoneNumberNormalizer.Normalize(p))
+                .Where(p => p is not null).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+            if (phones.Length != 1 || !string.Equals(phones[0], addressPhone, StringComparison.OrdinalIgnoreCase)
+                || !participants.TryGetValue($"phone:{addressPhone}", out var phoneParticipant)) continue;
+            foreach (var rawEmail in card.Emails)
+            {
+                var email = rawEmail.Trim().ToLowerInvariant();
+                if (string.IsNullOrEmpty(email)) continue;
+                // A separately addressed email or a shared card address is ambiguous: preserve it.
+                if (string.Equals(StripAddressPrefix(message.SenderAddressing ?? ""), email, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(StripAddressPrefix(message.RecipientAddressing ?? ""), email, StringComparison.OrdinalIgnoreCase)
+                    || allCards.Count(c => c.Emails.Any(e => string.Equals(e.Trim(), email, StringComparison.OrdinalIgnoreCase))) != 1)
+                    continue;
+                if (!participants.TryGetValue($"email:{email}", out var alias)
+                    || alias.HasSenderSideRole != phoneParticipant.HasSenderSideRole
+                    || alias.HasRecipientSideRole != phoneParticipant.HasRecipientSideRole) continue;
+                phoneParticipant.Emails.Add(email);
+                participants.Remove(alias.Key);
+            }
+        }
+    }
+
+    private static bool IsPlainSms(MessageRecord message) =>
+        string.Equals(message.Type, "SMS_GSM", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(message.Type, "SMS_CDMA", StringComparison.OrdinalIgnoreCase);
 
     private static void AddAddressParticipant(
         Dictionary<string, MutableParticipant> participants,
@@ -998,12 +1055,13 @@ public sealed class ConversationSynthesizer
             || string.Equals(contact.UniqueIdentifier, "0", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static SelfIdentity BuildSelfIdentity(IEnumerable<ContactRecord> contacts)
+    private static SelfIdentity BuildSelfIdentity(IEnumerable<ContactRecord> contacts, IReadOnlyCollection<string>? confirmedPhones)
     {
         var selfContacts = contacts.Where(IsSelfContact).ToArray();
-        var phones = selfContacts
-            .SelectMany(contact => contact.Phones)
-            .Select(phone => phone.Normalized)
+        // An explicit per-device list takes precedence over potentially incorrect PBAP owner cards.
+        var phones = (confirmedPhones is { Count: > 0 }
+                ? confirmedPhones.Select(phone => PhoneNumberNormalizer.Normalize(phone))
+                : selfContacts.SelectMany(contact => contact.Phones).Select(phone => phone.Normalized))
             .Where(phone => !string.IsNullOrWhiteSpace(phone))
             .Select(phone => phone!)
             .Distinct(StringComparer.OrdinalIgnoreCase)

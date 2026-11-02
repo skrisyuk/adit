@@ -13,6 +13,29 @@ public sealed class DaemonOptions
 
     public string? DefaultNameContains { get; init; } = "iPhone";
 
+    public IReadOnlyDictionary<string, string[]> SelfPhoneNumbersByDevice { get; init; }
+        = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+
+    public IReadOnlyCollection<string> GetSelfPhoneNumbers(string deviceId) =>
+        SelfPhoneNumbersByDevice.TryGetValue(deviceId, out var phones) ? phones : Array.Empty<string>();
+
+    public static IReadOnlyDictionary<string, string[]> ParseSelfPhoneNumbers(string? json)
+    {
+        var result = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(json)) return result;
+        var entries = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string[]>>(json)
+            ?? throw new ArgumentException("Self-phone configuration must be a JSON object.");
+        foreach (var (id, phones) in entries)
+        {
+            if (string.IsNullOrWhiteSpace(id) || phones is null)
+                throw new ArgumentException("Self-phone configuration requires a device ID and number array.");
+            if (phones.Any(p => p is null || !System.Text.RegularExpressions.Regex.IsMatch(p, @"^\+[1-9][0-9]{6,14}$")))
+                throw new ArgumentException("Self phone numbers must use international format, for example +12025550100.");
+            result.Add(id, phones.Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
+        }
+        return result;
+    }
+
     public string DatabasePath { get; init; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "Adit",
@@ -78,6 +101,7 @@ public sealed class DaemonOptions
         return new DaemonOptions
         {
             ListenUrl = NormalizeListenUrl(Environment.GetEnvironmentVariable("ADIT_URL")),
+            SelfPhoneNumbersByDevice = ParseSelfPhoneNumbers(Environment.GetEnvironmentVariable("ADIT_SELF_PHONE_NUMBERS_BY_DEVICE")),
             DefaultNameContains = Environment.GetEnvironmentVariable("ADIT_DEFAULT_NAME_CONTAINS") ?? "iPhone",
             DatabasePath = Environment.GetEnvironmentVariable("ADIT_DB_PATH")
                 ?? Path.Combine(

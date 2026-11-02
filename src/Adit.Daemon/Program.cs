@@ -1,3 +1,4 @@
+using Serilog;
 using System.Net.WebSockets;
 using System.Net;
 using System.Security.Cryptography;
@@ -21,6 +22,15 @@ if (builderArgs is null)
 }
 
 var builder = WebApplication.CreateBuilder(builderArgs);
+var logPath = Environment.GetEnvironmentVariable("ADIT_LOG_PATH")
+    ?? Path.Combine(Path.GetDirectoryName(Path.GetFullPath(daemonOptions.DatabasePath))!, "logs", "adit.log");
+using var rollingLogger = RollingLog.Create(logPath);
+builder.Logging.ClearProviders();
+builder.Logging.AddSerilog(rollingLogger, dispose: false);
+AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+{
+    rollingLogger.Fatal(e.ExceptionObject as Exception, "Unhandled daemon exception");
+};
 
 builder.WebHost.ConfigureKestrel(options => ConfigureLoopbackBinding(options, daemonOptions.ListenUri));
 builder.Services.AddSingleton(daemonOptions);
@@ -799,6 +809,20 @@ app.MapGet(
             cancellationToken);
         return Results.Ok(new { target, conversationId = resolvedConversationId, count = messages.Count, messages });
     });
+
+// Suggestions are evidence for user confirmation, never applied automatically.
+app.MapGet("/v1/identity", async Task<IResult> (
+    string? deviceId, string? nameContains, DeviceCatalog deviceCatalog,
+    RuntimeStateService runtimeStateService, SqliteCacheStore cacheStore, CancellationToken cancellationToken) =>
+{
+    var target = await ResolveClassicTargetAsync(deviceCatalog, runtimeStateService, daemonOptions, deviceId, nameContains);
+    if (target is null) return Results.NotFound(new { error = "No device matched." });
+    var messages = await cacheStore.GetStoredMessagesAsync(target.Id, null, null, 1000, cancellationToken);
+    var contacts = await cacheStore.GetContactsAsync(target.Id, null, cancellationToken);
+    var candidates = SelfPhoneSuggestions.Build(messages.Select(m => m.Message), contacts);
+    return Results.Ok(new { deviceId = target.Id, confirmedNumbers = daemonOptions.GetSelfPhoneNumbers(target.Id),
+        candidates, requiresConfirmation = true });
+});
 
 app.MapGet(
     "/v1/conversations",

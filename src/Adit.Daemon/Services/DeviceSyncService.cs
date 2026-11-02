@@ -421,7 +421,7 @@ public sealed class DeviceSyncService : BackgroundService
                 liveSnapshot.Messages.Concat(completedSendIntentMessages),
                 options.MessageCacheLimit);
         var messageNotifications = await GetMessagesNotificationsAsync(target.Id, cancellationToken);
-        var synthesis = conversationSynthesizer.Synthesize(mergedMessages, contacts, messageNotifications);
+        var synthesis = conversationSynthesizer.Synthesize(mergedMessages, contacts, messageNotifications, options.GetSelfPhoneNumbers(target.Id));
         synthesis = await learnedThreadReranker.TryRerankAsync(synthesis, messageNotifications, cancellationToken);
 
         await cacheStore.ReplaceMessageSnapshotAsync(target.Id, synthesis, cancellationToken);
